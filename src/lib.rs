@@ -93,6 +93,7 @@ pub type LocalStackFuture<'a, T, const STACK_SIZE: usize> = StackFutureImpl<'a, 
 pub struct StackFutureImpl<'a, T, const STACK_SIZE: usize, const SEND: bool> {
     /// An array of bytes that is used to store the wrapped future.
     data: [MaybeUninit<u8>; STACK_SIZE],
+    data_length: usize,
     /// Since the type of `StackFuture` does not know the underlying future that it is wrapping,
     /// we keep a manual vtable that serves pointers to Poll::poll and Drop::drop. These are
     /// generated and filled in by `StackFuture::from`.
@@ -118,8 +119,7 @@ pub struct StackFutureImpl<'a, T, const STACK_SIZE: usize, const SEND: bool> {
 // SAFETY:
 // We ensure by the API exposed for this type that the contained future will always be Send
 // as long as the `SEND` const generic arg is true.
-unsafe impl<'a, T, const STACK_SIZE: usize> Send for StackFutureImpl<'a, T, STACK_SIZE, true>
-{ }
+unsafe impl<'a, T, const STACK_SIZE: usize> Send for StackFutureImpl<'a, T, STACK_SIZE, true> {}
 
 impl<'a, T, const STACK_SIZE: usize> StackFutureImpl<'a, T, { STACK_SIZE }, true> {
     /// Creates a `StackFuture` from an existing future
@@ -250,7 +250,7 @@ impl<'a, T, const STACK_SIZE: usize, const SEND: bool> StackFutureImpl<'a, T, ST
 
         // Statically assert that `F` meets all the size and alignment requirements
         #[allow(clippy::let_unit_value)]
-        let _ = AssertFits::<F, STACK_SIZE>::ASSERT;
+        let _ = AssertFits::<F, STACK_SIZE, T>::ASSERT;
 
         Self::try_from_inner(future).unwrap()
     }
@@ -262,6 +262,7 @@ impl<'a, T, const STACK_SIZE: usize, const SEND: bool> StackFutureImpl<'a, T, ST
         if Self::has_space_for_val(&future) && Self::has_alignment_for_val(&future) {
             let mut result = Self {
                 data: [MaybeUninit::uninit(); STACK_SIZE],
+                data_length: Self::required_space::<F>(),
                 // SAFETY:
                 // `poll_inner` and `drop_inner` both require `F` to match the future type
                 // used to construct `self` here. The invariants on the `poll_fn` and `drop_fn`
@@ -302,6 +303,31 @@ impl<'a, T, const STACK_SIZE: usize, const SEND: bool> StackFutureImpl<'a, T, ST
     {
         Self::try_from_inner(future).unwrap_or_else(|err| Self::from_inner(Box::pin(err.into_inner())))
     }
+
+    pub const fn resize<const NEW_STACK_SIZE: usize>( self ) -> StackFutureImpl<'a, T, NEW_STACK_SIZE, SEND> {
+        if NEW_STACK_SIZE >= self.data_length && mem::align_of::<StackFutureImpl<'a, T, NEW_STACK_SIZE, SEND>>() >= mem::align_of::<Self>() {
+            let mut data = [MaybeUninit::uninit(); NEW_STACK_SIZE];
+            data.copy_from_slice( self.data.split_at(self.data_length).0 );
+
+            let poll_fn = unsafe { * (self.poll_fn as *const fn(this: Pin<&mut StackFutureImpl<'a, T, NEW_STACK_SIZE, SEND>>, cx: &mut Context<'_>) -> Poll<T>) };
+            let drop_fn = unsafe { * (self.drop_fn as *const fn(this: &mut StackFutureImpl<'a, T, NEW_STACK_SIZE, SEND>)) };
+
+            let result = StackFutureImpl::<T, NEW_STACK_SIZE, SEND> {
+                data,
+                data_length: self.data_length,
+                poll_fn,
+                drop_fn,
+                _phantom: self._phantom,
+            };
+
+            crate::mem::forget(self);
+
+            result
+        } else {
+            panic!("Unsufficient space!")
+        }
+    }
+
 
     /// A wrapper around the inner future's poll function, which we store in the poll_fn field
     /// of this struct.
@@ -409,9 +435,9 @@ impl<'a, T, const STACK_SIZE: usize, const SEND: bool> Drop for StackFutureImpl<
     }
 }
 
-struct AssertFits<F, const STACK_SIZE: usize>(PhantomData<F>);
+struct AssertFits<F, const STACK_SIZE: usize, T>(PhantomData<(F, T)>);
 
-impl<F, const STACK_SIZE: usize> AssertFits<F, STACK_SIZE> {
+impl<F, const STACK_SIZE: usize, T> AssertFits<F, STACK_SIZE, T> {
     const ASSERT: () = {
         if !StackFuture::<F, STACK_SIZE>::has_space_for::<F>() {
             concat_panic!(
